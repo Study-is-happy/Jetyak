@@ -43,6 +43,8 @@ python2 my_listener.py
 ```
 
 #### play bags
+Download dataset from https://drive.google.com/file/d/1U8Xa5Jk4Rzh9-SgfYF97TdHZqxbLix5W/view?usp=sharing
 ```
+cd your_dataset_folder
 rosbag play *.bag
 ```
