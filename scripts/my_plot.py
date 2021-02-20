@@ -2,10 +2,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-plt.ion
+plt.ion()
 
 
 def plot(img, radar_dt):
+
+    plt.clf()
 
     plt_mngr = plt.get_current_fig_manager()
     plt_mngr.window.wm_geometry("+60+25")
