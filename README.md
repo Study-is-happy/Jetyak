@@ -29,6 +29,7 @@ pip2 install scikit-image
 
 ## Run
 ```
+cd scripts
 python2 my_listener.py
 
 ```
