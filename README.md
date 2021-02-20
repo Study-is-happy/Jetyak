@@ -13,7 +13,7 @@ sudo apt install ros-melodic-geographic-msgs
 sudo apt install libgeographic-dev
 ```
 
-#### Install packages in catkin_ws
+#### install packages in catkin_ws
 ```
 git clone https://github.com/juancamilog/br24.git
 git clone https://github.com/mavlink/mavros.git
@@ -28,13 +28,21 @@ pip2 install scikit-image
 ```
 
 ## Run
+
+#### start roscore
+
+```
+roscore
+```
+
+#### run python script
+
 ```
 cd scripts
 python2 my_listener.py
-
 ```
 
-#### Play bag
+#### play bags
 ```
 rosbag play *.bag
 ```
