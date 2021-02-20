@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import rospy
 from br24.msg import BR24Scanline
 from sensor_msgs.msg import NavSatFix

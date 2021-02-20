@@ -14,13 +14,13 @@ from mavros_msgs.srv import WaypointPush, WaypointClear, WaypointPull
 from mavros_msgs.msg import WaypointList, Waypoint
 
 import my_filter
-# import my_plot
+import my_plot
 # import my_satellite_plot
 import my_util
 import my_cpa
 
 input_waypoints = []
-with open("/home/zhiyongzhang/dataset/HendersonToMIT.waypoints") as waypoints_file:
+with open("HendersonToMIT.waypoints") as waypoints_file:
     waypoints_file.readline()
     for raw_waypoint in waypoints_file:
         waypoint = raw_waypoint.strip().split("\t")
@@ -29,15 +29,15 @@ with open("/home/zhiyongzhang/dataset/HendersonToMIT.waypoints") as waypoints_fi
 
 
 land_area_shp = geopandas.read_file(
-    "/home/zhiyongzhang/dataset/shapefiles/BostonUTM.shp")
+    "shapefiles/BostonUTM.shp")
 
 bridge_hole_shp = geopandas.read_file(
-    "/home/zhiyongzhang/dataset/bridgesshapefiles/Bridges.shp")
+    "bridgesshapefiles/Bridges.shp")
 
 
 img_dim = 2000
 
-# plot_img_dim = 640
+plot_img_dim = 640
 
 ship_data = []
 
@@ -212,7 +212,7 @@ def process(radar_data, config):
 
     del radar_data["scanline"]
 
-    cv2_contours, _ = cv2.findContours(
+    _, cv2_contours, _ = cv2.findContours(
         np.array(scanlines), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
     del scanlines
@@ -229,12 +229,12 @@ def process(radar_data, config):
     process_img = np.zeros(
         (img_dim * 2, img_dim * 2), np.uint8)
 
-    # plot_img = np.empty(
-    #     (plot_img_dim * 2, plot_img_dim * 2, 3), np.uint8)
-    # plot_img.fill(255)
+    plot_img = np.empty(
+        (plot_img_dim * 2, plot_img_dim * 2, 3), np.uint8)
+    plot_img.fill(255)
 
-    # plot_img_scale = 2. / (np.cos(np.radians(my_util.utm_to_latlng(self_utm)[0])) * 2 *
-    #                        np.pi * 6378137 / (256. * 2.**17))
+    plot_img_scale = 2. / (np.cos(np.radians(my_util.utm_to_latlng(self_utm)[0])) * 2 *
+                           np.pi * 6378137 / (256. * 2.**17))
 
     for cv2_contour in cv2_contours:
 
@@ -255,7 +255,7 @@ def process(radar_data, config):
 
     del radar_data
 
-    cv2_contours, _ = cv2.findContours(
+    _, cv2_contours, _ = cv2.findContours(
         process_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
     current_land_polygons = []
@@ -275,9 +275,9 @@ def process(radar_data, config):
 
             cv2.fillPoly(process_img, [buffer_points], 1)
 
-            # cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-            #     points, self_utm, img_scale, img_dim, plot_img_scale,
-            #     plot_img_dim)], (189, 195, 199))
+            cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
+                points, self_utm, img_scale, img_dim, plot_img_scale,
+                plot_img_dim)], (189, 195, 199))
 
     current_bridge_polygons = []
 
@@ -292,9 +292,9 @@ def process(radar_data, config):
 
             cv2.fillPoly(process_img, [points], 0)
 
-            # cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-            #     points, self_utm, img_scale, img_dim, plot_img_scale,
-            #     plot_img_dim)], (189, 195, 199))
+            cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
+                points, self_utm, img_scale, img_dim, plot_img_scale,
+                plot_img_dim)], (189, 195, 199))
 
     temp_ship_data = []
 
@@ -314,10 +314,9 @@ def process(radar_data, config):
 
         if check_polygon(current_land_polygons, shapely_contour) or check_polygon(current_bridge_polygons, shapely_contour):
 
-            pass
-            # cv2.polylines(plot_img, [my_util.img_to_plot_img(
-            #     cv2_contour, self_utm, img_scale, img_dim, plot_img_scale,
-            #     plot_img_dim)], True, (220, 220, 220), 4)
+            cv2.polylines(plot_img, [my_util.img_to_plot_img(
+                cv2_contour, self_utm, img_scale, img_dim, plot_img_scale,
+                plot_img_dim)], True, (220, 220, 220), 4)
 
         else:
 
@@ -333,9 +332,9 @@ def process(radar_data, config):
             temp_ship_data.append({"measurement":
                                    [rect[0][0], rect[0][1], np.deg2rad(rect[2])], "rect": rect})
 
-            # cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-            #     cv2_contour, self_utm, img_scale, img_dim, plot_img_scale,
-            #     plot_img_dim)], (255, 0, 0))
+            cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
+                cv2_contour, self_utm, img_scale, img_dim, plot_img_scale,
+                plot_img_dim)], (255, 0, 0))
 
     del cv2_contours
 
@@ -400,7 +399,7 @@ def process(radar_data, config):
             CTRV_Q_aug = np.diag([0.5**2, (np.pi / 48)**2])
 
             ship = {
-                # "plot_trajectory": [],
+                "plot_trajectory": [],
                 "CTRV": my_filter.CTRV(
                     CTRV_x, CTRV_P, CTRV_R, CTRV_Q, CTRV_Q_aug, config["radar_dt"])}
 
@@ -477,10 +476,10 @@ def process(radar_data, config):
             cv2.fillConvexPoly(
                 process_img, projection_points, 1)
 
-            # cv2.polylines(
-            #     plot_img, [my_util.img_to_plot_img(
-            #         projection_points, self_utm, img_scale,
-            #         img_dim, plot_img_scale, plot_img_dim)], True, (255, 0, 0), 5)
+            cv2.polylines(
+                plot_img, [my_util.img_to_plot_img(
+                    projection_points, self_utm, img_scale,
+                    img_dim, plot_img_scale, plot_img_dim)], True, (255, 0, 0), 5)
 
             del projection_points
 
@@ -540,11 +539,11 @@ def process(radar_data, config):
                     cv2.fillConvexPoly(
                         process_img, COLREGS_points, 1)
 
-                    # cv2.polylines(
-                    #     plot_img, [my_util.img_to_plot_img(
-                    #         COLREGS_points, self_utm, img_scale,
-                    #         img_dim, plot_img_scale, plot_img_dim)], True, (0, 0,
-                    #                                                         255), 5)
+                    cv2.polylines(
+                        plot_img, [my_util.img_to_plot_img(
+                            COLREGS_points, self_utm, img_scale,
+                            img_dim, plot_img_scale, plot_img_dim)], True, (0, 0,
+                                                                            255), 5)
 
         ship["CTRV"].predict()
 
@@ -553,16 +552,16 @@ def process(radar_data, config):
 
         ship["rect"] = tuple(temp_ship["rect"])
 
-        # ship["plot_trajectory"].append(temp_ship["measurement"])
+        ship["plot_trajectory"].append(temp_ship["measurement"])
 
-        # if len(ship["plot_trajectory"]) > 1:
-        #     utm_plot_trajectory = np.array(ship["plot_trajectory"])[:, 0:2]
-        #     img_index_plot_trajectory = my_util.get_round_int(my_util.utm_to_img_index(
-        #         utm_plot_trajectory, self_utm, img_scale, img_dim))
-        #     cv2.polylines(
-        #         plot_img, [my_util.img_to_plot_img(
-        #             img_index_plot_trajectory, self_utm, img_scale, img_dim,
-        #             plot_img_scale, plot_img_dim)], False, (255, 0, 0), 4)
+        if len(ship["plot_trajectory"]) > 1:
+            utm_plot_trajectory = np.array(ship["plot_trajectory"])[:, 0:2]
+            img_index_plot_trajectory = my_util.get_round_int(my_util.utm_to_img_index(
+                utm_plot_trajectory, self_utm, img_scale, img_dim))
+            cv2.polylines(
+                plot_img, [my_util.img_to_plot_img(
+                    img_index_plot_trajectory, self_utm, img_scale, img_dim,
+                    plot_img_scale, plot_img_dim)], False, (255, 0, 0), 4)
 
         current_ship_data.append(ship)
 
@@ -577,7 +576,7 @@ def process(radar_data, config):
 
     label_count, label_img = cv2.connectedComponents(process_img)
 
-    img_contours, _ = cv2.findContours(
+    _, img_contours, _ = cv2.findContours(
         process_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
 
     img_contour_dict = {}
@@ -764,56 +763,56 @@ def process(radar_data, config):
         path = np.squeeze(path, -2)
         path = optimizate_path(process_img, path)
 
-        # cv2.polylines(plot_img, [my_util.img_to_plot_img(
-        #     np.flip(path, -1), self_utm, img_scale, img_dim, plot_img_scale, plot_img_dim)],
-        #     False, (247, 220, 111), 4)
+        cv2.polylines(plot_img, [my_util.img_to_plot_img(
+            np.flip(path, -1), self_utm, img_scale, img_dim, plot_img_scale, plot_img_dim)],
+            False, (247, 220, 111), 4)
 
         path = path[1:]
 
-        waypointList = WaypointList()
+        # waypointList = WaypointList()
 
-        for utm in my_util.img_index_to_utm(path, self_utm, img_scale, img_dim):
-            latlng = my_util.utm_to_latlng(utm)
-            waypoint = Waypoint()
-            waypoint.frame = 3
-            waypoint.command = 16
-            waypoint.is_current = False
-            waypoint.autocontinue = True
-            waypoint.param1 = 0
-            waypoint.param2 = 0
-            waypoint.param3 = 0
-            waypoint.param4 = 0
-            waypoint.x_lat = latlng[0]
-            waypoint.y_long = latlng[1]
-            waypoint.z_alt = 100
-            waypointList.waypoints.append(waypoint)
+        # for utm in my_util.img_index_to_utm(path, self_utm, img_scale, img_dim):
+        #     latlng = my_util.utm_to_latlng(utm)
+        #     waypoint = Waypoint()
+        #     waypoint.frame = 3
+        #     waypoint.command = 16
+        #     waypoint.is_current = False
+        #     waypoint.autocontinue = True
+        #     waypoint.param1 = 0
+        #     waypoint.param2 = 0
+        #     waypoint.param3 = 0
+        #     waypoint.param4 = 0
+        #     waypoint.x_lat = latlng[0]
+        #     waypoint.y_long = latlng[1]
+        #     waypoint.z_alt = 100
+        #     waypointList.waypoints.append(waypoint)
 
-        waypointList.waypoints[0].is_current = True
+        # waypointList.waypoints[0].is_current = True
 
-        waypointPush_service = rospy.ServiceProxy(
-            "/mavros/mission/push", WaypointPush)
-        waypointPush_service.call(0, waypointList.waypoints)
+        # waypointPush_service = rospy.ServiceProxy(
+        #     "/mavros/mission/push", WaypointPush)
+        # waypointPush_service.call(0, waypointList.waypoints)
 
-        del waypointList
+        # del waypointList
 
-        # for point in path:
-        #     cv2.circle(plot_img, tuple(my_util.img_to_plot_img(
-        #         np.flip(point), self_utm, img_scale, img_dim, plot_img_scale, plot_img_dim)),
-        #         8, (241, 196, 15), -1)
+        for point in path:
+            cv2.circle(plot_img, tuple(my_util.img_to_plot_img(
+                np.flip(point), self_utm, img_scale, img_dim, plot_img_scale, plot_img_dim)),
+                8, (241, 196, 15), -1)
     else:
         pass
-        waypointClear_service = rospy.ServiceProxy(
-            "/mavros/mission/clear", WaypointClear)
-        waypointClear_service.call()
+        # waypointClear_service = rospy.ServiceProxy(
+        #     "/mavros/mission/clear", WaypointClear)
+        # waypointClear_service.call()
 
-    # plot_self_points = my_util.get_round_int(cv2.boxPoints((
-    #     my_util.utm_to_img_index(self_utm, self_utm, img_scale, img_dim),
-    #     (config["self_length"] * img_scale * 5, config["self_width"] * img_scale
-    #      * 5), np.degrees(self_angle))))
+    plot_self_points = my_util.get_round_int(cv2.boxPoints((
+        my_util.utm_to_img_index(self_utm, self_utm, img_scale, img_dim),
+        (config["self_length"] * img_scale * 5, config["self_width"] * img_scale
+         * 5), np.degrees(self_angle))))
 
-    # cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-    #     plot_self_points, self_utm, img_scale, img_dim, plot_img_scale,
-    #     plot_img_dim)], (0, 255, 0))
+    cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
+        plot_self_points, self_utm, img_scale, img_dim, plot_img_scale,
+        plot_img_dim)], (0, 255, 0))
 
     end = time.time()
     print "Time:", end - start
@@ -822,5 +821,5 @@ def process(radar_data, config):
     # multiprocessing.Process(target=my_satellite_plot.plot,
     # args=(plot_img, self_utm, config["radar_dt"])).start()
 
-    # multiprocessing.Process(target=my_plot.plot,
-    #                         args=(plot_img, config["radar_dt"])).start()
+    multiprocessing.Process(target=my_plot.plot,
+                            args=(plot_img, config["radar_dt"])).start()
