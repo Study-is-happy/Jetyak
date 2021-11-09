@@ -22,9 +22,11 @@ catkin_make
 
 #### pip install
 ```
-pip2 install geopandas
-pip2 install scipy
-pip2 install scikit-image
+pip install geopandas
+pip install scipy
+pip install scikit-image
+pip install utm
+pip install sympy
 ```
 
 ## Run

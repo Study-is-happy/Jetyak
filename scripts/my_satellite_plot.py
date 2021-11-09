@@ -19,7 +19,7 @@ def plot(img, self_utm, radar_dt):
 
     latlng = my_util.utm_to_latlng(self_utm)
 
-    url = "http://maps.googleapis.com/maps/api/staticmap?maptype=satellite&size=1280x1280&scale=2&zoom=17&key=AIzaSyCeI41vEw-q7QtdET1v9JjmTweu_zDTGO8&center=" + \
+    url = "http://maps.googleapis.com/maps/api/staticmap?maptype=satellite&size=1280x1280&scale=2&zoom=17&key=AIzaSyBxQGd1Fn1Gng7nSiYd8oTqoIlKQng2MDA&center=" + \
         str(latlng[0]) + "," + str(latlng[1])
 
     buffer = BytesIO(urlopen(url).read())

@@ -2,824 +2,583 @@ import numpy as np
 import cv2
 import time
 import geopandas
-import multiprocessing
-import rospy
+import itertools
+import shapely
+import scipy
+import scipy.stats
+import os
+import matplotlib.pyplot as plt
 
-from shapely.geometry import Polygon, LineString, Point, MultiPoint
-from shapely import affinity
-from scipy.stats import multivariate_normal
-from skimage import draw
 
-from mavros_msgs.srv import WaypointPush, WaypointClear, WaypointPull
-from mavros_msgs.msg import WaypointList, Waypoint
-
-import my_filter
-import my_plot
-# import my_satellite_plot
+import Kalman_filter
+# import my_plot
 import my_util
-import my_cpa
+# import my_cpa
+import cache_satellite_images
+
+import rospy
+import json
+import base64
 
 input_waypoints = []
-with open("HendersonToMIT.waypoints") as waypoints_file:
+with open('HendersonToMIT_2.waypoints') as waypoints_file:
     waypoints_file.readline()
-    for raw_waypoint in waypoints_file:
-        waypoint = raw_waypoint.strip().split("\t")
+    for waypoint in waypoints_file:
+        waypoint = np.float64(waypoint.strip().split('\t')[8:10])
         input_waypoints.append(
-            my_util.latlng_to_utm(np.array(waypoint[8:10], np.float32)))
+            my_util.latlng_to_utm(waypoint))
+
+land_polygons = []
+for land_polygon in geopandas.read_file('shape_files/lands.shp').geometry:
+    land_polygons.append(land_polygon)
+
+bridge_polygons = []
+for bridge_polygon in geopandas.read_file('shape_files/bridges.shp').geometry:
+    bridge_polygons.append(bridge_polygon)
+
+boundary_polygons = []
+for boundary_polygon in geopandas.read_file('shape_files/boundaries.shp').geometry:
+    boundary_polygons.append(boundary_polygon)
+
+static_obstacle_polygon = shapely.ops.unary_union(land_polygons + bridge_polygons + boundary_polygons)
+
+hole_polygons = []
+for hole_polygon in geopandas.read_file('shape_files/holes.shp').geometry:
+    hole_polygons.append(hole_polygon)
+hole_polygons = shapely.geometry.MultiPolygon(hole_polygons)
 
 
-land_area_shp = geopandas.read_file(
-    "shapefiles/BostonUTM.shp")
+image_utm_ratio = 2.0
+half_image_dim = 640
 
-bridge_hole_shp = geopandas.read_file(
-    "bridgesshapefiles/Bridges.shp")
+prev_target_list = []
+cache_frames = 2
 
+# time_stamp_sec = str(1553700607)
 
-img_dim = 2000
+# with open('prev_target_list/' + time_stamp_sec + '.json') as prev_target_list_file:
+#     prev_target_list = json.load(prev_target_list_file)
+#     prev_target_list = json.loads(prev_target_list)
 
-plot_img_dim = 640
+#     for prev_target in prev_target_list:
 
-ship_data = []
+#         prev_target['x'] = np.array(prev_target['x'])
+#         prev_target['P'] = np.array(prev_target['P'])
+#         prev_target['pdf'] = scipy.stats.multivariate_normal(
+#             mean=prev_target['x'][:2], cov=prev_target['P'][:2, :2])
 
+# with open('radar_data/' + time_stamp_sec + '.json') as radar_data_file:
+#     radar_data = json.load(radar_data_file)
+#     radar_data = json.loads(radar_data)
+#     for index, scanline in enumerate(radar_data['scanline']):
+#         radar_data['scanline'][index] = base64.b64decode(scanline)
 
-def get_path_distance(path):
-
-    path2 = path.copy()
-
-    path = np.append(path, [path[-1]], 0)
-
-    path2 = np.insert(path2, 0, path2[0], 0)
-
-    return np.sum(np.sqrt(np.sum(np.square(path - path2), 1)))
-
-
-def check_polygon(current_polygons, shapely_contour):
-
-    for current_polygon in current_polygons:
-        if shapely_contour.intersects(current_polygon):
-            return True
-    return False
+# with open('jetyak_config/' + time_stamp_sec + '.json') as jetyak_config_file:
+#     jetyak_config = json.load(jetyak_config_file)
+#     jetyak_config = json.loads(jetyak_config)
+#     jetyak_config['yaw'] = np.array(jetyak_config['yaw'])
 
 
-def check_border(path):
-    return np.any((path == 0) | (path == img_dim * 2 - 1))
+class NumpyEncoder(json.JSONEncoder):
+
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, scipy.stats._multivariate.multivariate_normal_frozen):
+            return None
+        elif isinstance(obj, bytes):
+            return base64.b64encode(obj).decode('UTF8')
+        return json.JSONEncoder.default(self, obj)
 
 
-def find_valid_contour(border):
+def find_outside_point(point, obstacle_polygons):
 
-    return np.invert(np.all([border, np.roll(border, -1, 0), np.roll(border, 1, 0)], 0))
+    obstacle_lines = []
 
+    obstacle_polygons = obstacle_polygons.buffer(1.)
 
-def find_border(img_contour):
-    return np.any((img_contour == 0) | (img_contour == img_dim * 2 - 1), -1)
+    if isinstance(obstacle_polygons, shapely.geometry.Polygon):
+        obstacle_polygons = [obstacle_polygons]
 
+    for obstacle_polygon in obstacle_polygons:
+        obstacle_lines.append(obstacle_polygon.exterior)
+        for obstacle_polygon_interior in obstacle_polygon.interiors:
+            obstacle_lines.append(obstacle_polygon_interior)
 
-def check_outside(point):
-    return np.any((point < 0) | (point >= img_dim * 2))
+    obstacle_lines = shapely.geometry.MultiLineString(obstacle_lines)
 
-
-def check_inside(points):
-    return np.any(np.all((points >= 0) & (points < img_dim * 2), -1))
-
-
-def check_valid_point(process_img, point):
-    return not check_outside(point) and process_img[point[0]][point[1]] == 0
-
-
-def find_valid_point(process_img, point):
-    temp_point = np.array([point[0] + 1, point[1]])
-    if check_valid_point(process_img, temp_point):
-        return temp_point
-    temp_point = np.array([point[0] - 1, point[1]])
-    if check_valid_point(process_img, temp_point):
-        return temp_point
-    temp_point = np.array([point[0], point[1] + 1])
-    if check_valid_point(process_img, temp_point):
-        return temp_point
-    temp_point = np.array([point[0], point[1] - 1])
-    if check_valid_point(process_img, temp_point):
-        return temp_point
+    return shapely.ops.nearest_points(point, obstacle_lines)[1]
 
 
 def find_nearest_index(points, point):
     return np.argmin(np.sqrt(np.sum(np.square(points - point), -1)))
 
 
-def find_nearest_contour_indexs(img_contour, point):
-    argmins = []
-    points = []
-    for contour in img_contour:
+def process(radar_data, jetyak_config, time_stamp):
 
-        argmin = find_nearest_index(contour, point)
-        argmins.append(argmin)
-        points.append(contour[argmin])
+    global prev_target_list
 
-    argmin = find_nearest_index(points, point)
+    # dumped_prev_target_list = json.dumps(prev_target_list, cls=NumpyEncoder)
+    # with open('prev_target_list/' + str(time_stamp.secs) + '.json', 'w') as json_file:
+    #     json.dump(dumped_prev_target_list, json_file)
 
-    return [argmin, argmins[argmin]]
+    # dumped_radar_data = json.dumps(radar_data, cls=NumpyEncoder)
+    # with open('radar_data/' + str(time_stamp.secs) + '.json', 'w') as json_file:
+    #     json.dump(dumped_radar_data, json_file)
 
-
-def check_path(process_img, point1, point2):
-
-    path_is, path_js = draw.line(point1[0], point1[1],
-                                 point2[0], point2[1])
-
-    return not np.any(process_img[path_is[1:-1], path_js[1:-1]] != 0)
-
-
-def binary_search(line_points):
-    for index, line_point in enumerate(line_points):
-        if check_outside(line_point):
-            return index - 1
-
-
-def optimizate_path(process_img, current_path):
-    start_index = 0
-
-    while start_index < len(current_path) - 2:
-        start_point = current_path[start_index]
-        end_index = len(current_path) - 1
-        while end_index > start_index + 1:
-            end_point = current_path[end_index]
-            if check_path(process_img, start_point, end_point):
-                current_path = np.delete(current_path, xrange(
-                    start_index + 1, end_index), 0)
-                break
-            end_index -= 1
-        start_index += 1
-    return current_path
-
-
-def get_cv2_kernel(kernel_distance):
-
-    kernel_n = kernel_distance * 2 + 1
-
-    kernel_x, kernel_y = np.ogrid[-kernel_distance:kernel_n - kernel_distance, -
-                                  kernel_distance:kernel_n - kernel_distance]
-    kernel_mask = kernel_x ** 2 + kernel_y ** 2 <= kernel_distance**2
-
-    kernel = np.zeros((kernel_n, kernel_n))
-
-    kernel[kernel_mask] = 1
-
-    return np.uint8(kernel)
-
-
-def remove_self(amplitudes):
-    start_decrease = False
-    index = 1
-    while index < len(amplitudes):
-
-        if amplitudes[index] < amplitudes[index - 1]:
-            start_decrease = True
-
-        elif start_decrease:
-            amplitudes[index - 1] = np.uint8(0)
-            break
-
-        amplitudes[index - 1] = np.uint8(0)
-        index += 1
-
-
-def get_ellipse(center, cov):
-    vals, vecs = np.linalg.eigh(cov)
-    angle = np.arctan2(vecs[1, 0], vecs[0, 0])
-    weight, height = np.sqrt(vals)
-    return np.array(affinity.rotate(affinity.scale(Point(center).buffer(
-        1.), weight, height), np.degrees(angle)).exterior)
-
-
-def process(radar_data, config):
+    # dumped_jetyak_config = json.dumps(jetyak_config, cls=NumpyEncoder)
+    # with open('jetyak_config/' + str(time_stamp.secs) + '.json', 'w') as json_file:
+    #     json.dump(dumped_jetyak_config, json_file)
 
     start = time.time()
 
-    radar_data["scanline"].append(radar_data["scanline"][0])
-    radar_data["utm"].append(radar_data["utm"][0])
-    radar_data["angle"].append(radar_data["angle"][0])
+    jetyak_utm = radar_data['utm'][-1]
+    jetyak_point = shapely.geometry.Point(jetyak_utm)
+    jetyak_yaw = np.pi / 2 - radar_data['angle'][-1]
+    radar_dt = jetyak_config['radar_dt']
+
+    # plot_image = np.zeros((half_image_dim * 2, half_image_dim * 2, 3), np.uint8)
+
+    image_file_name = 'satellite_images/' + str(jetyak_utm[0]) + '_' + str(jetyak_utm[1]) + '.png'
+    if not os.path.exists(image_file_name):
+        cache_satellite_images.cache_satellite_images(jetyak_utm[0], jetyak_utm[1])
+
+    plot_image = cv2.imread(image_file_name)
+    plot_image = cv2.cvtColor(np.flipud(plot_image), cv2.COLOR_BGR2RGB)
+
+    def fill_polygon_alpha(polygon, color, alpha):
+
+        points = [my_util.utm_to_image(np.array(polygon.exterior), jetyak_utm, image_utm_ratio, half_image_dim)]
+
+        for interior in polygon.interiors:
+            points.append(my_util.utm_to_image(np.array(interior), jetyak_utm, image_utm_ratio, half_image_dim))
+
+        layer = plot_image.copy()
+
+        cv2.fillPoly(layer, points, color)
+
+        cv2.addWeighted(plot_image, alpha, layer, 1 - alpha, 0, plot_image)
+
+        cv2.polylines(plot_image, points, True, color, 2)
+
+    # fill_polygon_alpha(static_obstacle_polygon, (189, 195, 199), 0)
+
+    radar_data['scanline'].extend(radar_data['scanline'][:10])
+    radar_data['angle'].extend(radar_data['angle'][:10])
+    radar_data['utm'].extend(radar_data['utm'][:10])
+
+    radar_data['angle'] = np.array(radar_data['angle'])
+    radar_data['utm'] = np.array(radar_data['utm'])
+
+    plot_jetyak_polygon = shapely.geometry.Polygon(cv2.boxPoints((
+        jetyak_utm, (jetyak_config['length'] * 5, jetyak_config['width'] * 5), np.degrees(jetyak_yaw))))
+
+    fill_polygon_alpha(plot_jetyak_polygon, (0, 255, 0), 0.4)
+
+    # for radar_utm in radar_data['utm']:
+    #     cv2.circle(plot_image, tuple(my_util.utm_to_image(radar_utm, jetyak_utm, image_utm_ratio, half_image_dim)), int(5 * image_utm_ratio), (0, 255, 0), 2)
 
     scanlines = []
 
-    for scanline in radar_data["scanline"]:
+    for scanline in radar_data['scanline']:
 
-        amplitudes = np.array([np.uint8(ord(raw_amplitude))
-                               for raw_amplitude in scanline])
+        scanline = np.frombuffer(scanline, dtype=np.uint8).copy()
 
-        remove_self(amplitudes)
+        # scanline[: 13] = 255
+        scanline[: np.argmax(scanline == 0)] = 0
 
-        amplitudes[amplitudes < 100] = 0
+        # scanline[scanline < 255] = 0
 
-        scanlines.append(amplitudes)
+        scanlines.append(scanline)
 
-    del radar_data["scanline"]
-
-    _, cv2_contours, _ = cv2.findContours(
+    radar_contours, _ = cv2.findContours(
         np.array(scanlines), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-    del scanlines
+    radar_polygons = []
 
-    radar_data["utm"] = np.array(radar_data["utm"])
-    radar_data["angle"] = np.array(radar_data["angle"])
+    for radar_contour in radar_contours:
 
-    self_utm = np.array(config["self_utm"])
-    self_angle = np.pi / 2 - config["self_angle"]
-    self_speed = config["self_speed"]
-    # img_scale = img_dim / config["radar_distance"]
-    img_scale = 2.
+        temp_radar_coutour = radar_contour.copy()
 
-    process_img = np.zeros(
-        (img_dim * 2, img_dim * 2), np.uint8)
+        radar_contour = np.squeeze(radar_contour, -2)
 
-    plot_img = np.empty(
-        (plot_img_dim * 2, plot_img_dim * 2, 3), np.uint8)
-    plot_img.fill(255)
+        distances = (radar_contour[:, 0]) / 512. * jetyak_config['radar_distance']
 
-    plot_img_scale = 2. / (np.cos(np.radians(my_util.utm_to_latlng(self_utm)[0])) * 2 *
-                           np.pi * 6378137 / (256. * 2.**17))
+        radar_indexes = radar_contour[:, 1]
 
-    for cv2_contour in cv2_contours:
+        angles = radar_data['angle'][radar_indexes]
 
-        cv2_contour = np.squeeze(cv2_contour, -2)
+        utm_offsets = radar_data['utm'][radar_indexes]
 
-        distances = (cv2_contour[:, 0] + 1.) / 512. * \
-            config["radar_distance"] * img_scale
+        radar_contour = np.array([np.sin(angles) * distances, np.cos(angles) * distances]).T + utm_offsets
 
-        angles = radar_data["angle"][cv2_contour[:, 1]]
+        if len(radar_contour) >= 3:
 
-        offsets = my_util.utm_to_img_index(
-            radar_data["utm"][cv2_contour[:, 1]], self_utm, img_scale, img_dim)
+            radar_polygon = shapely.geometry.Polygon(radar_contour)
 
-        points = my_util.get_round_int(np.array([np.sin(angles) * distances,
-                                                 np.cos(angles) * distances]).T + offsets)
+            if radar_polygon.is_valid:
+                radar_polygons.append(radar_polygon)
 
-        cv2.fillPoly(process_img, [points], 1)
-
-    del radar_data
-
-    _, cv2_contours, _ = cv2.findContours(
-        process_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-    current_land_polygons = []
-
-    for land_polygon in land_area_shp.geometry:
-
-        points = my_util.get_round_int(my_util.utm_to_img_index(np.array(land_polygon.exterior),
-                                                                self_utm, img_scale, img_dim))
-        if check_inside(points):
-
-            current_land_polygons.append(Polygon(points))
-
-            buffer_land_polygon = land_polygon.buffer(10.)
-
-            buffer_points = my_util.get_round_int(my_util.utm_to_img_index(np.array(buffer_land_polygon.exterior),
-                                                                           self_utm, img_scale, img_dim))
-
-            cv2.fillPoly(process_img, [buffer_points], 1)
-
-            cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-                points, self_utm, img_scale, img_dim, plot_img_scale,
-                plot_img_dim)], (189, 195, 199))
-
-    current_bridge_polygons = []
-
-    for bridge_polygon in bridge_hole_shp.geometry:
-
-        points = my_util.get_round_int(my_util.utm_to_img_index(np.array(bridge_polygon.exterior),
-                                                                self_utm, img_scale, img_dim))
-
-        if check_inside(points):
-
-            current_bridge_polygons.append(Polygon(points))
-
-            cv2.fillPoly(process_img, [points], 0)
-
-            cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-                points, self_utm, img_scale, img_dim, plot_img_scale,
-                plot_img_dim)], (189, 195, 199))
-
-    temp_ship_data = []
-
-    for cv2_contour in cv2_contours:
-
-        cv2_contour = np.squeeze(cv2_contour, -2)
-
-        if len(cv2_contour) == 1:
-            shapely_contour = Point(cv2_contour[0])
-        elif len(cv2_contour) == 2:
-            shapely_contour = LineString(cv2_contour)
-        else:
-            shapely_contour = Polygon(cv2_contour)
-
-        if not shapely_contour.is_valid:
-            shapely_contour = shapely_contour.buffer(0.1)
-
-        if check_polygon(current_land_polygons, shapely_contour) or check_polygon(current_bridge_polygons, shapely_contour):
-
-            cv2.polylines(plot_img, [my_util.img_to_plot_img(
-                cv2_contour, self_utm, img_scale, img_dim, plot_img_scale,
-                plot_img_dim)], True, (220, 220, 220), 4)
-
-        else:
-
-            rect = list(cv2.minAreaRect(
-                np.float32(my_util.img_index_to_utm(cv2_contour, self_utm, img_scale, img_dim))))
-
-            rect[1] = list(rect[1])
-
-            if rect[1][0] < rect[1][1]:
-                rect[2] += 90
-                rect[1][0], rect[1][1] = rect[1][1], rect[1][0]
-
-            temp_ship_data.append({"measurement":
-                                   [rect[0][0], rect[0][1], np.deg2rad(rect[2])], "rect": rect})
-
-            cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-                cv2_contour, self_utm, img_scale, img_dim, plot_img_scale,
-                plot_img_dim)], (255, 0, 0))
-
-    del cv2_contours
-
-    del current_land_polygons
-
-    del current_bridge_polygons
-
-    # data association
-
-    global associations
-    global associations_pdf
-
-    associations = []
-    associations_pdf = -1
-
-    global ship_data
-
-    def get_associations(temp_associations, temp_associations_pdf):
-        temp_ship_index = len(temp_associations)
-        if temp_ship_index == len(temp_ship_data):
-            global associations
-            global associations_pdf
-            if temp_associations_pdf > associations_pdf:
-                associations = temp_associations
-                associations_pdf = temp_associations_pdf
-        else:
-            temp_ship = temp_ship_data[temp_ship_index]
-            for index, ship in enumerate(ship_data):
-                if index not in temp_associations:
-                    pdf = ship["pdf"].pdf(
-                        temp_ship["measurement"][0:2])
-
-                    distance = my_util.get_distance(
-                        temp_ship["rect"][0], ship["rect"][0])
-
-                    if pdf > 0.000001 and distance < config["radar_dt"] * 10:
-                        get_associations(
-                            temp_associations + [index], temp_associations_pdf + pdf)
-
-            get_associations(
-                temp_associations + [-1], temp_associations_pdf)
-
-    get_associations([], 0)
-
-    current_ship_data = []
-
-    for index, association in enumerate(associations):
-        temp_ship = temp_ship_data[index]
-
-        if association == -1:
-            CTRV_x = np.array(
-                [temp_ship["measurement"][0], temp_ship["measurement"][1], 0., temp_ship["measurement"][2], 0.])
-            CTRV_P = np.diag(
-                [1.**2, 1.**2, 5.**2, (np.pi / 8)**2, (np.pi / 12)**2])
-            CTRV_R = np.diag([1.**2, 1.**2, (np.pi / 8)**2])
-            CTRV_Q = np.diag(
-                [(0.5 * 0.5 * config["radar_dt"]**2)**2,
-                 (0.5 * 0.5 * config["radar_dt"]**2)**2,
-                 (0.5 * config["radar_dt"])**2,
-                 (np.pi / 48 * config["radar_dt"])**2,
-                 (np.pi / 48 * config["radar_dt"])**2])
-            CTRV_Q_aug = np.diag([0.5**2, (np.pi / 48)**2])
-
-            ship = {
-                "plot_trajectory": [],
-                "CTRV": my_filter.CTRV(
-                    CTRV_x, CTRV_P, CTRV_R, CTRV_Q, CTRV_Q_aug, config["radar_dt"])}
-
-        else:
-            ship = ship_data[association]
-
-            angle_diff = my_util.normalize_radian(
-                temp_ship["measurement"][2] - np.deg2rad(ship["rect"][2]))
-
-            if abs(angle_diff) > np.pi / 2:
-                temp_ship["measurement"][2] += np.pi
-                temp_ship["rect"][2] += 180
-
-            ship["CTRV"].update(np.array(temp_ship["measurement"]))
-
-            ship_center = tuple(ship["CTRV"].x[0:2])
-
-            ship_speed = ship["CTRV"].x[2]
-
-            ship_speed_dev = np.sqrt(ship["CTRV"].P[2][2])
-
-            ship_angle = ship["CTRV"].x[3]
-
-            ship_angle_dev = np.sqrt(ship["CTRV"].P[3][3])
-
-            if ship_speed < 0:
-                ship_speed = -ship_speed
-                ship_angle += np.pi
-
-            ellipse_points = get_ellipse(ship_center, ship["CTRV"].P[0:2, 0:2])
-
-            ship_points = []
-
-            for ellipse_point in ellipse_points:
-                ship_points.extend(cv2.boxPoints((ellipse_point,
-                                                  temp_ship["rect"][1], np.degrees(ship_angle))))
-
-            del ellipse_points
-
-            ship_points = np.squeeze(
-                cv2.convexHull(np.array(ship_points)))
-
-            long_axis = Point(ship_center).hausdorff_distance(
-                Polygon(ship_points))
-
-            rotate_angles = np.linspace(-ship_angle_dev, ship_angle_dev, 10)
-
-            projection_points = []
-
-            projection_distance = (ship_speed + ship_speed_dev) * 5
-
-            for rotate_angle in rotate_angles:
-
-                rotate_ship_points = np.array(affinity.rotate(MultiPoint(ship_points),
-                                                              rotate_angle, ship_center, use_radians=True))
-
-                projection_points.extend(rotate_ship_points)
-
-                relative_angle = rotate_angle + ship_angle
-
-                for rotate_ship_point in rotate_ship_points:
-
-                    projection_points.append(my_util.get_rotate_point(
-                        rotate_ship_point, relative_angle, projection_distance))
-
-            del rotate_angles
-
-            projection_points = cv2.convexHull(
-                np.array(projection_points, np.float32))
-
-            projection_points = my_util.get_round_int(my_util.utm_to_img_index(
-                projection_points, self_utm, img_scale, img_dim))
-
-            cv2.fillConvexPoly(
-                process_img, projection_points, 1)
-
-            cv2.polylines(
-                plot_img, [my_util.img_to_plot_img(
-                    projection_points, self_utm, img_scale,
-                    img_dim, plot_img_scale, plot_img_dim)], True, (255, 0, 0), 5)
-
-            del projection_points
-
-            relative_angle = np.arctan2(
-                ship_center[1] - self_utm[1], ship_center[0] - self_utm[0])
-
-            if abs(my_util.normalize_radian(relative_angle - self_angle)) < np.pi / 2:
-
-                cpa = my_cpa.CPA(self_utm, ship_center, self_speed,
-                                 ship_speed, self_angle, ship_angle)
-
-                if cpa.get_t() >= 0 and cpa.get_t() <= 60 and cpa.get_d() <= 50 + long_axis + config["self_bevel"]:
-
-                    angle_diff = np.degrees(
-                        my_util.normalize_radian(self_angle - ship_angle))
-
-                    if angle_diff < 0:
-                        angle_diff += 360
-
-                    COLREGS_projection_distance = projection_distance + long_axis
-
-                    COLREGS_points = [ship_center]
-
-                    if angle_diff >= 165 and angle_diff <= 195:
-                        rotate_angles = np.linspace(-np.pi / 2,
-                                                    0, 10) + ship_angle
-
-                        for rotate_angle in rotate_angles:
-                            COLREGS_points.append(my_util.get_rotate_point(
-                                ship_center, rotate_angle, COLREGS_projection_distance * 2))
-
-                    elif angle_diff > 195 and angle_diff < 292.5:
-                        rotate_angles = np.linspace(-ship_angle_dev,
-                                                    ship_angle_dev, 10) + ship_angle
-
-                        for rotate_angle in rotate_angles:
-                            COLREGS_points.append(my_util.get_rotate_point(
-                                ship_center, rotate_angle, COLREGS_projection_distance * 2))
-
-                    elif angle_diff >= 292.5 or angle_diff <= 67.5:
-                        rotate_angles = np.linspace(-np.pi / 4,
-                                                    np.pi / 4, 10) + ship_angle
-
-                        for rotate_angle in rotate_angles:
-                            COLREGS_points.append(my_util.get_rotate_point(
-                                ship_center, rotate_angle, COLREGS_projection_distance))
+            else:
+                radar_polygon = radar_polygon.buffer(0)
+                if not radar_polygon.is_empty:
+                    if isinstance(radar_polygon, shapely.geometry.Polygon):
+                        radar_polygons.append(radar_polygon)
 
                     else:
-                        pass
+                        for single_radar_polygon in radar_polygon:
+                            radar_polygons.append(single_radar_polygon)
 
-                    COLREGS_points = cv2.convexHull(
-                        np.array(COLREGS_points, np.float32))
+    radar_polygons = shapely.ops.unary_union(radar_polygons)
 
-                    COLREGS_points = my_util.get_round_int(my_util.utm_to_img_index(
-                        COLREGS_points, self_utm, img_scale, img_dim))
+    if isinstance(radar_polygons, shapely.geometry.Polygon):
+        radar_polygons = shapely.geometry.MultiPolygon([radar_polygons])
 
-                    cv2.fillConvexPoly(
-                        process_img, COLREGS_points, 1)
+    target_list = []
 
-                    cv2.polylines(
-                        plot_img, [my_util.img_to_plot_img(
-                            COLREGS_points, self_utm, img_scale,
-                            img_dim, plot_img_scale, plot_img_dim)], True, (0, 0,
-                                                                            255), 5)
+    for static_obstacle_interior in static_obstacle_polygon.interiors:
 
-        ship["CTRV"].predict()
+        static_interior_polygon = shapely.geometry.Polygon(static_obstacle_interior)
 
-        ship["pdf"] = multivariate_normal(
-            mean=ship["CTRV"].z_pred[0:2], cov=ship["CTRV"].P[0:2, 0:2])
+        if jetyak_point.within(static_interior_polygon):
+            jetyak_interior_polygon = static_interior_polygon
+            break
 
-        ship["rect"] = tuple(temp_ship["rect"])
+    else:
+        jetyak_interior_polygon = shapely.geometry.Polygon()
 
-        ship["plot_trajectory"].append(temp_ship["measurement"])
+    for radar_polygon in radar_polygons:
 
-        if len(ship["plot_trajectory"]) > 1:
-            utm_plot_trajectory = np.array(ship["plot_trajectory"])[:, 0:2]
-            img_index_plot_trajectory = my_util.get_round_int(my_util.utm_to_img_index(
-                utm_plot_trajectory, self_utm, img_scale, img_dim))
-            cv2.polylines(
-                plot_img, [my_util.img_to_plot_img(
-                    img_index_plot_trajectory, self_utm, img_scale, img_dim,
-                    plot_img_scale, plot_img_dim)], False, (255, 0, 0), 4)
+        if radar_polygon.area > 10:
 
-        current_ship_data.append(ship)
+            if radar_polygon.within(jetyak_interior_polygon):
 
-    ship_data = current_ship_data
+                target_point = radar_polygon.centroid
 
-    # shortest path
+                target_list.append({'z': np.array(target_point),
+                                    'radius': target_point.hausdorff_distance(radar_polygon)})
 
-    safe_distance = config["self_length"] * img_scale * 1.5
+                fill_polygon_alpha(radar_polygon, (225, 0, 0), 0.6)
 
-    process_img = cv2.dilate(
-        process_img, get_cv2_kernel(int(safe_distance * 1.2)))
+            else:
 
-    label_count, label_img = cv2.connectedComponents(process_img)
+                fill_polygon_alpha(radar_polygon, (220, 220, 220), 0.4)
 
-    _, img_contours, _ = cv2.findContours(
-        process_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    # global prev_target_list
 
-    img_contour_dict = {}
-    for i in xrange(1, label_count):
-        img_contour_dict[i] = []
+    assoications = []
+    assoications_pdf = []
 
-    img_border_dict = {}
+    for target_index, target in enumerate(target_list):
 
-    for img_contour in img_contours:
+        negative_index = -(target_index + 1)
+        target_assoications = [negative_index]
+        target_assoications_pdf = {negative_index: 0}
 
-        img_contour = np.flip(np.squeeze(img_contour, -2), -1)
+        for prev_target_index, prev_target in enumerate(prev_target_list):
+            association_pdf = prev_target['pdf'].pdf(target['z'])
 
-        first_point = img_contour[0]
-        label = label_img[first_point[0]][first_point[1]]
+            if association_pdf > 0.00001:
+                target_assoications.append(prev_target_index)
+                target_assoications_pdf[prev_target_index] = association_pdf
 
-        border = find_border(img_contour)
-        valid_contour = find_valid_contour(border)
+        assoications.append(target_assoications)
+        assoications_pdf.append(target_assoications_pdf)
 
-        img_contour_dict[label].append(img_contour[valid_contour])
+    best_association_pdf_sum = -1
+    best_association = []
 
-        img_border_dict[label] = img_contour[
-            np.all([border, valid_contour], 0)]
+    for assoication in itertools.product(*assoications):
+        if len(set(assoication)) == len(assoication):
 
-    del img_contours
+            assoication_pdf_sum = 0
 
-    self_point = np.flip(my_util.get_round_int(my_util.utm_to_img_index(
-        np.array(self_utm), self_utm, img_scale, img_dim)))
+            for target_index, prev_target_index in enumerate(assoication):
+                assoication_pdf_sum += assoications_pdf[target_index][prev_target_index]
 
-    path = [self_point]
+            if assoication_pdf_sum > best_association_pdf_sum:
+                best_association_pdf_sum = assoication_pdf_sum
+                best_association = assoication
 
-    self_label = label_img[self_point[0]][self_point[1]]
+    radar_filter = Kalman_filter.Radar_model(radar_dt)
 
-    if self_label != 0:
-        img_contour = img_contour_dict[self_label]
+    COLREGS_polygons = []
 
-        nearest_indexs = find_nearest_contour_indexs(img_contour, self_point)
-        nearest_point = img_contour[nearest_indexs[0]][nearest_indexs[1]]
-        valid_point = find_valid_point(process_img, nearest_point)
-        path.append(valid_point)
+    for target_index, prev_target_index in enumerate(best_association):
+
+        target = target_list[target_index]
+
+        if prev_target_index < 0:
+
+            target['x'] = np.array(
+                [target['z'][0], target['z'][1], 0., 0.])
+
+            target['P'] = np.diag(
+                [1.**2, 1.**2, 1.5**2, 1.5**2])
+
+            target['trajectory'] = []
+
+        else:
+
+            prev_target = prev_target_list[prev_target_index]
+
+            prev_target['cache'] = -1
+
+            target['x'], target['P'] = radar_filter.update(prev_target['x'], prev_target['P'], target['z'])
+
+            target['trajectory'] = prev_target['trajectory'].copy()
+
+            if len(target['trajectory']) > 2:
+
+                is_ahead = abs(my_util.normalize_radian(np.arctan2(
+                    target['x'][1] - jetyak_utm[1], target['x'][0] - jetyak_utm[0]) - jetyak_yaw)) < np.pi / 2
+
+                if is_ahead:
+
+                    target_yaw = np.arctan2(target['x'][3], target['x'][2])
+
+                    yaw_diff = np.degrees(
+                        my_util.normalize_radian(jetyak_yaw - target_yaw))
+
+                    if yaw_diff < 0:
+                        yaw_diff += 360
+
+                    COLREGS_radius = cv2.norm(target['x'][2:]) * 5 + target['radius']
+
+                    COLREGS_points = [target['x'][:2]]
+
+                    is_COLREGS = True
+
+                    if yaw_diff >= 165 and yaw_diff <= 195:
+                        rotate_angles = np.linspace(-np.pi / 2,
+                                                    0, 5) + target_yaw
+
+                    elif yaw_diff > 195 and yaw_diff < 292.5:
+                        rotate_angles = np.linspace(-np.pi / 4,
+                                                    np.pi / 4, 5) + target_yaw
+
+                    elif yaw_diff >= 292.5 or yaw_diff <= 67.5:
+                        rotate_angles = np.linspace(0,
+                                                    np.pi / 2, 5) + target_yaw
+
+                    else:
+                        is_COLREGS = False
+
+                    if is_COLREGS:
+
+                        for rotate_angle in rotate_angles:
+                            COLREGS_points.append(my_util.get_rotate_points(
+                                target['x'][:2], rotate_angle, COLREGS_radius))
+
+                        COLREGS_polygon = shapely.geometry.Polygon(np.array(COLREGS_points))
+
+                        COLREGS_polygons.append(COLREGS_polygon)
+
+                        fill_polygon_alpha(COLREGS_polygon, (0, 0, 255), 0.6)
+
+        target['trajectory'].append(target['x'][:2])
+
+        cv2.polylines(plot_image, [my_util.utm_to_image(np.array(target['trajectory']), jetyak_utm, image_utm_ratio, half_image_dim)], False, (255, 0, 0), 2)
+
+        target['x'], target['P'] = radar_filter.predict(target['x'], target['P'])
+
+        target['pdf'] = scipy.stats.multivariate_normal(
+            mean=target['x'][:2], cov=target['P'][:2, :2])
+
+        target['cache'] = 1
+
+    for prev_target in prev_target_list:
+
+        if prev_target['cache'] != -1:
+
+            prev_target['cache'] += 1
+
+            if prev_target['cache'] <= cache_frames:
+                target_list.append(prev_target)
+
+    prev_target_list = target_list
+
+    obstacle_polygons = shapely.ops.unary_union([static_obstacle_polygon, radar_polygons] + COLREGS_polygons)
+
+    safe_distance = jetyak_config['length'] * 1.5
+
+    obstacle_polygons = obstacle_polygons.buffer(safe_distance)
+
+    obstacle_polygons = obstacle_polygons.difference(hole_polygons)
+
+    if isinstance(obstacle_polygons, shapely.geometry.Polygon):
+        obstacle_polygons = shapely.geometry.MultiPolygon([obstacle_polygons])
+
+    # plot_image.fill(0)
+
+    # for obstacle_polygon in obstacle_polygons:
+    #     fill_polygon_alpha(obstacle_polygon, 255, 0)
 
     while len(input_waypoints) != 0:
 
-        first_waypoint = np.flip(my_util.get_round_int(my_util.utm_to_img_index(
-            input_waypoints[0], self_utm, img_scale, img_dim)))
+        waypoint = input_waypoints[0]
 
-        if my_util.get_distance(first_waypoint, self_point) < 10.:
+        if cv2.norm(jetyak_utm, waypoint) < 5.:
             del input_waypoints[0]
         else:
             break
 
-    if len(input_waypoints) != 0:
+    waypoint_point = shapely.geometry.Point(waypoint)
 
-        line_points = np.array(draw.line(path[-1][0], path[-1][1],
-                                         first_waypoint[0], first_waypoint[1])).T
+    path = [jetyak_utm]
 
-        if check_outside(first_waypoint):
-            border_index = binary_search(line_points)
-            line_point = line_points[border_index]
-            label = label_img[line_point[0]][line_point[1]]
-            if label == 0:
-                line_points = line_points[:border_index + 1]
-                path.append(line_point)
-            else:
-                img_border = img_border_dict[label]
+    if jetyak_point.within(obstacle_polygons):
+        valid_jetyak_point = find_outside_point(jetyak_point, obstacle_polygons)
+        valid_jetyak_utm = np.array(valid_jetyak_point)
+        path.append(valid_jetyak_utm)
 
-                border_point = img_border[
-                    find_nearest_index(img_border, line_point)]
-                valid_point = find_valid_point(process_img, border_point)
+    else:
+        valid_jetyak_point = jetyak_point
+        valid_jetyak_utm = jetyak_utm
 
-                line_points = np.array(draw.line(path[-1][0], path[-1][1],
-                                                 valid_point[0], valid_point[1])).T
+    jetyak_obstacle_polygon_interior = None
+    waypoint_obstacle_polygon_interior = None
 
-                path.append(valid_point)
+    for obstacle_polygon in obstacle_polygons:
+
+        if waypoint_point.within(obstacle_polygon):
+            raise Exception('waypoint inside')
+
+        for obstacle_interior in obstacle_polygon.interiors:
+
+            obstacle_polygon_interior = shapely.geometry.Polygon(obstacle_interior)
+
+            jetyak_within_interior = valid_jetyak_point.within(obstacle_polygon_interior)
+            waypoint_within_interior = waypoint_point.within(obstacle_polygon_interior)
+
+            if jetyak_within_interior:
+                jetyak_obstacle_polygon = shapely.geometry.Polygon(obstacle_polygon.exterior, holes=[obstacle_interior])
+                jetyak_obstacle_polygon_interior = obstacle_polygon_interior
+            if waypoint_within_interior:
+                waypoint_obstacle_polygon_interior = obstacle_polygon_interior
+
+        if jetyak_obstacle_polygon_interior is not None and waypoint_obstacle_polygon_interior is not None:
+            break
+
+    if jetyak_obstacle_polygon is not None:
+
+        if jetyak_obstacle_polygon_interior == waypoint_obstacle_polygon_interior:
+            valid_waypoint_point = waypoint_point
+            valid_waypoint = waypoint
 
         else:
-            label = label_img[first_waypoint[0]][first_waypoint[1]]
-            if label == 0:
-                path.append(first_waypoint)
+            valid_waypoint_point = shapely.ops.nearest_points(jetyak_obstacle_polygon_interior, waypoint_obstacle_polygon_interior)[0]
+            valid_waypoint_point = find_outside_point(valid_waypoint_point, obstacle_polygons)
+            valid_waypoint = np.array(valid_waypoint_point)
+
+        current_obstacle_polygons = [jetyak_obstacle_polygon]
+
+        for obstacle_polygon in obstacle_polygons:
+            if obstacle_polygon.within(jetyak_obstacle_polygon.interiors[0]):
+                current_obstacle_polygons.append(shapely.geometry.Polygon(obstacle_polygon.exterior))
+
+        current_obstacle_polygons = shapely.geometry.MultiPolygon(current_obstacle_polygons)
+
+        path_line = shapely.geometry.LineString([valid_jetyak_utm, valid_waypoint_point])
+
+        intersect_lines = path_line.intersection(current_obstacle_polygons)
+
+        intersect_points = []
+
+        if not intersect_lines.is_empty:
+
+            if isinstance(intersect_lines, shapely.geometry.LineString):
+                intersect_points = intersect_lines
+
             else:
-                img_contour = img_contour_dict[label]
-                nearest_indexs = find_nearest_contour_indexs(
-                    img_contour, first_waypoint)
-                nearest_point = img_contour[
-                    nearest_indexs[0]][nearest_indexs[1]]
+                for intersect_line in intersect_lines:
+                    for intersect_point in intersect_line.coords:
+                        intersect_points.append(intersect_point)
 
-                valid_point = find_valid_point(process_img, nearest_point)
+            intersect_points = np.insert(path_line, 1, intersect_points, axis=0)
 
-                line_points = np.array(draw.line(path[-1][0], path[-1][1],
-                                                 valid_point[0], valid_point[1])).T
+            for intersect_index in range(3, len(intersect_points), 2):
 
-                path.append(valid_point)
+                start_intersect_point = intersect_points[intersect_index - 2]
+                end_intersect_point = intersect_points[intersect_index - 1]
 
-        previous_label = 0
-        previous_point = None
-        first_label = 0
+                intersect_line = shapely.geometry.LineString([(intersect_points[intersect_index - 3] + start_intersect_point) / 2,
+                                                              (end_intersect_point + intersect_points[intersect_index]) / 2])
 
-        for line_point in line_points[1:]:
+                for current_obstacle_polygon in current_obstacle_polygons:
+                    if intersect_line.intersects(current_obstacle_polygon):
 
-            label = label_img[line_point[0]][line_point[1]]
+                        split_polygons = list(shapely.ops.split(current_obstacle_polygon, intersect_line))
 
-            # start or end+1
-            if label != previous_label:
+                        best_length = current_obstacle_polygon.length
 
-                # start
-                if first_label == 0:
-                    first_label = label
-                    img_contour = img_contour_dict[label]
-                    first_indexs = find_nearest_contour_indexs(
-                        img_contour, line_point)
+                        for index, split_polygon in enumerate(split_polygons):
+                            if split_polygon.length < best_length:
+                                best_length < split_polygon.length
+                                best_index = index
 
-                # end+1
-                elif previous_label == first_label:
-                    img_contour = img_contour_dict[previous_label]
-                    last_indexs = find_nearest_contour_indexs(
-                        img_contour, previous_point)
+                        best_obstacle_contour = np.array(split_polygons[best_index].exterior)
 
-                    # same dim
-                    if first_indexs[0] == last_indexs[0]:
+                        start_contour_index = find_nearest_index(best_obstacle_contour, start_intersect_point)
+                        end_contour_index = find_nearest_index(best_obstacle_contour, end_intersect_point)
 
-                        first_index = first_indexs[1]
-                        last_index = last_indexs[1]
-                        img_contour = img_contour[first_indexs[0]]
+                        len_best_obstacle_contour = len(best_obstacle_contour)
+                        abs_start_end_index = abs(start_contour_index - end_contour_index)
 
-                        img_contour_len = len(img_contour)
+                        if (start_contour_index < end_contour_index and abs_start_end_index < len_best_obstacle_contour - abs_start_end_index) or \
+                                (start_contour_index > end_contour_index and abs_start_end_index > len_best_obstacle_contour - abs_start_end_index):
+                            best_obstacle_contour = np.flip(best_obstacle_contour, axis=0)
 
-                        double_img_contour = np.concatenate(
-                            [img_contour, img_contour])
+                            start_contour_index = len_best_obstacle_contour - 1 - start_contour_index
+                            end_contour_index = len_best_obstacle_contour - 1 - end_contour_index
 
-                        if first_index < last_index:
-                            left_path = double_img_contour[
-                                first_index + img_contour_len:last_index - 1:-1]
+                        best_obstacle_contour = np.roll(best_obstacle_contour, -start_contour_index, axis=0)
 
-                            right_path = img_contour[
-                                first_index:last_index + 1]
+                        best_obstacle_contour = best_obstacle_contour[:end_contour_index - start_contour_index + 1]
 
-                        else:
-                            left_path = double_img_contour[
-                                first_index + img_contour_len:last_index + img_contour_len - 1:-1]
+                        path.extend(best_obstacle_contour)
+                        break
 
-                            right_path = double_img_contour[
-                                first_index:last_index + img_contour_len + 1]
+        path.append(valid_waypoint)
 
-                        left_invalid = check_border(left_path[:-1])
-
-                        right_invalid = check_border(right_path[:-1])
-
-                        if left_invalid and right_invalid:
-                            break
-
-                        elif left_invalid:
-                            current_path = right_path
-                        elif right_invalid:
-                            current_path = left_path
-                        else:
-                            if get_path_distance(left_path) < get_path_distance(right_path):
-                                current_path = left_path
-                            else:
-                                current_path = right_path
-
-                        path = np.insert(path, -1, current_path, 0)
-
-                        first_label = 0
-
-            previous_point = line_point
-            previous_label = label
-
-        if first_label != 0:
-
-            path[-1] = img_contour_dict[first_label][first_indexs[0]][first_indexs[1]]
-
-    del img_border_dict
-
-    del label_img
-
-    del img_contour_dict
-
-    if len(path) != 1:
-
-        path = np.array(path)
-
-        process_img = cv2.erode(
-            process_img, get_cv2_kernel(int(safe_distance * 0.2)))
-        path = cv2.approxPolyDP(path, img_scale, False)
+        path = cv2.approxPolyDP(my_util.get_rint(path), 2., False)
         path = np.squeeze(path, -2)
-        path = optimizate_path(process_img, path)
 
-        cv2.polylines(plot_img, [my_util.img_to_plot_img(
-            np.flip(path, -1), self_utm, img_scale, img_dim, plot_img_scale, plot_img_dim)],
-            False, (247, 220, 111), 4)
+        start_index = 0
 
-        path = path[1:]
+        while start_index < len(path) - 2:
+            start_point = path[start_index]
+            end_index = len(path) - 1
+            while end_index > start_index + 1:
+                end_point = path[end_index]
+                path_line = shapely.geometry.LineString([start_point, end_point])
+                if not path_line.intersects(current_obstacle_polygons):
+                    path = np.delete(path, range(
+                        start_index + 1, end_index), 0)
+                    break
+                end_index -= 1
+            start_index += 1
 
-        # waypointList = WaypointList()
+    cv2.polylines(plot_image, [my_util.utm_to_image(path, jetyak_utm, image_utm_ratio, half_image_dim)],
+                  False, (247, 220, 111), 4)
 
-        # for utm in my_util.img_index_to_utm(path, self_utm, img_scale, img_dim):
-        #     latlng = my_util.utm_to_latlng(utm)
-        #     waypoint = Waypoint()
-        #     waypoint.frame = 3
-        #     waypoint.command = 16
-        #     waypoint.is_current = False
-        #     waypoint.autocontinue = True
-        #     waypoint.param1 = 0
-        #     waypoint.param2 = 0
-        #     waypoint.param3 = 0
-        #     waypoint.param4 = 0
-        #     waypoint.x_lat = latlng[0]
-        #     waypoint.y_long = latlng[1]
-        #     waypoint.z_alt = 100
-        #     waypointList.waypoints.append(waypoint)
+    path = path[1:]
 
-        # waypointList.waypoints[0].is_current = True
+    # update_waypoints(path)
 
-        # waypointPush_service = rospy.ServiceProxy(
-        #     "/mavros/mission/push", WaypointPush)
-        # waypointPush_service.call(0, waypointList.waypoints)
+    for point in path:
+        cv2.circle(plot_image, tuple(my_util.utm_to_image(point, jetyak_utm, image_utm_ratio, half_image_dim)),
+                   8, (241, 196, 15), -1)
+    # else:
+    #     clear_waypoints()
 
-        # del waypointList
-
-        for point in path:
-            cv2.circle(plot_img, tuple(my_util.img_to_plot_img(
-                np.flip(point), self_utm, img_scale, img_dim, plot_img_scale, plot_img_dim)),
-                8, (241, 196, 15), -1)
-    else:
-        pass
-        # waypointClear_service = rospy.ServiceProxy(
-        #     "/mavros/mission/clear", WaypointClear)
-        # waypointClear_service.call()
-
-    plot_self_points = my_util.get_round_int(cv2.boxPoints((
-        my_util.utm_to_img_index(self_utm, self_utm, img_scale, img_dim),
-        (config["self_length"] * img_scale * 5, config["self_width"] * img_scale
-         * 5), np.degrees(self_angle))))
-
-    cv2.fillPoly(plot_img, [my_util.img_to_plot_img(
-        plot_self_points, self_utm, img_scale, img_dim, plot_img_scale,
-        plot_img_dim)], (0, 255, 0))
+    cv2.imwrite('test_images/' + str(time_stamp.secs) + '.png',
+                cv2.cvtColor(np.flipud(plot_image), cv2.COLOR_RGB2BGR))
 
     end = time.time()
-    print "Time:", end - start
-    print "-----------------------------------------"
+    print(time_stamp.secs)
+    print('Time:', end - start)
+    print('-----------------------------------------')
 
-    # multiprocessing.Process(target=my_satellite_plot.plot,
-    # args=(plot_img, self_utm, config["radar_dt"])).start()
 
-    multiprocessing.Process(target=my_plot.plot,
-                            args=(plot_img, config["radar_dt"])).start()
+# process(radar_data, jetyak_config, rospy.Time.from_sec(0))

@@ -1,1 +1,12 @@
 *.pyc
+__pycache__/
+colregs_images/
+da_images/
+final_images/
+jetyak_config/
+prev_target_list/
+radar_data/
+raw_images/
+satellite_images/
+test_images/
+vo_images/
