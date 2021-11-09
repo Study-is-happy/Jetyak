@@ -1,10 +1,8 @@
 # jetyak
 
 ## Requirements
-- python2
-- matplotlib
-- opencv3
 - ros melodic
+- python
 
 ## Installation
 ```
@@ -22,11 +20,11 @@ catkin_make
 
 #### pip install
 ```
+pip install matplotlib
+pip install opencv-python
 pip install geopandas
 pip install scipy
-pip install scikit-image
 pip install utm
-pip install sympy
 ```
 
 ## Run
@@ -37,11 +35,11 @@ pip install sympy
 roscore
 ```
 
-#### run python script
+#### run listener script
 
 ```
 cd scripts
-python2 my_listener.py
+python my_listener.py
 ```
 
 #### play bags
